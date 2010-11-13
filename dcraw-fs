@@ -1,0 +1,209 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+#
+# Copyright © 2010 Camille Moncelier <moncelier@devlife.org>.
+# All Rights Reserved.
+#
+# usage: dcraw-fs \
+#      -o root=/home/user/Pictures \
+#      -o loglevel=debug \
+#      -o width=300 -o height=200 \
+#      -o cache_dir=/tmp/dcraw_fs_cache /home/user/fuse/Pictures
+#
+#
+# This file is dual licenced, you can choose one or both of the following
+# licences:
+#
+#    - GPL v3:
+#
+#      This program is free software; you can redistribute it and/or modify
+#      it under the terms of the GNU General Public License as published by the
+#      Free Software Foundation; either version 3, or (at your option) any later
+#      version.
+#
+#      This program is distributed in the hope that it will be useful, but
+#      WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTIBILITY
+#      or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+#      for more details.
+#
+#    - "THE BEER-WARE LICENSE" (Revision 42):
+#
+#      <moncelier@devlife.org> wrote this file.  As long as you retain this notice
+#      you can do whatever you want with this stuff. If we meet some day, and you
+#      think this stuff is worth it, you can buy me a beer in return.
+#      Camille Moncelier
+#
+
+import os
+import sys
+import fuse
+import pipes
+import syslog
+import logging
+import hashlib
+import subprocess
+import logging.handlers
+# Nice tree heh !
+
+fuse.fuse_python_api = (0, 2)
+
+
+log = logging.getLogger('dcrawfs')
+formatter = logging.Formatter("%(name)s[%(process)d]: %(levelname)s: %(message)s")
+syslogger = logging.handlers.SysLogHandler(
+    "/dev/log",
+    facility=logging.handlers.SysLogHandler.LOG_DAEMON)
+syslogger.setFormatter(formatter)
+log.addHandler(syslogger)
+
+class LoggingWrapper:
+    def __init__(self, name):
+        self.stream_name = name
+    def write(self, data):
+        log.debug("[%s] %s" % (self.stream_name, data.rstrip('\n').lstrip('\n')))
+
+class DCRawFS(fuse.Fuse):
+    """
+    This class alows to mount a directory containing RAW files
+    and convert these images to JPEG using dcraw on the fly
+    """
+
+    def is_raw_file(self, path):
+        basename, extension = os.path.splitext(path)
+        return extension.lower() in ('.nef', '.raw', '.crw')
+
+    def is_from_raw_file(self, path):
+        filename, extension = os.path.splitext(path)
+        return extension == ".jpg" and self.is_raw_file(filename)
+
+    def orig_filename(self, path):
+        if self.is_from_raw_file(path):
+            filename, extension = os.path.splitext(path)
+            return filename
+        else:
+            return path
+
+    def get_cached_filename(self, path):
+        md5 = hashlib.md5()
+        md5.update(path)
+        return '%s/%s-%s.jpg' % (
+                self.cache_dir,
+                os.path.basename(path),
+                md5.hexdigest()
+        )
+
+    def __init__(self, *args, **kw):
+        """
+        DCRawFS Initialisation
+        """
+        fuse.Fuse.__init__(self, *args, **kw)
+        self._openedFiles = {}
+        self.block_size = 128
+
+    def main(self, *a, **kw):
+
+        if self.loglevel == 'debug':
+           log.setLevel(logging.DEBUG)
+
+        log.debug('Root: %s', self.root)
+        log.debug('Cache dir: %s', self.cache_dir)
+
+        if not os.path.exists(self.cache_dir):
+            os.makedirs(self.cache_dir)
+
+        self.width = int(self.width)
+        self.height = int(self.height)
+
+        log.debug("Initialisation complete")
+
+        sys.stdout = LoggingWrapper('stdout')
+        sys.stderr = LoggingWrapper('stderr')
+
+        print 'toto'
+
+        return fuse.Fuse.main(self, *a, **kw)
+
+    def getattr(self, path):
+       log.debug('dcrawfs.getattr(%s)', path)
+       try:
+           if self.is_from_raw_file(path):
+               fname = self.get_cached_filename(self.orig_filename(path))
+               if not os.path.exists(fname):
+                   return os.stat(self.root + self.orig_filename(path))
+               else:
+                   return os.stat(fname)
+           else:
+               return os.stat(self.root + path)
+       except:
+           pass
+       return None
+
+
+    def readdir(self, path, offset):
+        log.debug('dcrawfs.readdir(%s, %s)' % (path, offset))
+        for entry in os.listdir(self.root + path):
+            if self.is_raw_file(entry):
+                yield fuse.Direntry(entry + ".jpg")
+            else:
+                yield fuse.Direntry(entry)
+
+    def open(self, path, flags):
+        log.debug('dcrawfs.open(%s, %s)' % (path, flags))
+        if self._openedFiles.has_key(path):
+            return
+
+        filename, extension = os.path.splitext(path)
+        if extension == ".jpg" and self.is_raw_file(filename):
+            # We have a raw file
+            fname = self.get_cached_filename(filename)
+            log.debug('fname: from %s to %s' % (path, fname))
+            if not os.path.exists(fname):
+                log.debug('Write thumbnail %s for path %s' % (fname, path))
+                command_line = 'dcraw -w -c -e %s | convert -gamma 2.2 -thumbnail %sx%s -auto-orient -unsharp 0x.5 -quality 85 - %s' % (
+                        pipes.quote(self.root + filename),
+                        self.width, self.height,
+                        pipes.quote(fname)
+                )
+                log.debug(command_line)
+                p = subprocess.Popen(command_line, shell=True)
+                sts = os.waitpid(p.pid, 0)
+            self._openedFiles[path] = open(fname, 'rb')
+        else:
+            self._openedFiles[path] = open(self.root + path, 'rb')
+
+    def read(self, path, length, offset):
+        log.debug('dcrawfs.read(path: %s, length: %s, offset: %s)' % (path, length, offset))
+        self._openedFiles[path].seek(offset)
+        return self._openedFiles[path].read(length)
+
+    def release(self, path, flags):
+        self._openedFiles[path].close()
+        del self._openedFiles[path]
+        return 0
+
+if __name__ == '__main__':
+    usage = """DCRawFS: Raw image conversion file system for images in given directory tree\n""" + fuse.Fuse.fusage
+
+    fs = DCRawFS(
+            version = "%prog" + fuse.__version__,
+            usage = usage,
+            dash_s_do = 'setsingle'
+    )
+
+    fs.parser.add_option(mountopt = "root",
+            metavar = "PATH", default = "/", help = "Root directory")
+    fs.parser.add_option(mountopt = "log", dest = "log",
+            metavar = "PATH", default = "/tmp/DCRawFS.log", help = "Log filename")
+    fs.parser.add_option(mountopt = "cache_dir",
+            metavar = "PATH", default = "/tmp/imcache", help = "Cache directory")
+    fs.parser.add_option(mountopt = "width",
+            metavar = " ", default = "1024", help = "Width")
+    fs.parser.add_option(mountopt = "height",
+            metavar = " ", default = "768", help = "Height")
+    fs.parser.add_option(mountopt = "loglevel",
+            metavar = " ", default = "debug", help = "Log level {none, debug}")
+
+    if not fs.parse(values = fs, errex = 1).getmod('showhelp'):
+        fs.flags = 0
+        fs.multithreaded = 0
+        fs.main()
